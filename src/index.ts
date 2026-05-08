@@ -43,8 +43,18 @@ export class BilibiliScheduleService extends Service {
   private videoIntervalId?: () => void
   private uploaderIntervalId?: () => void
 
+  private abortController: AbortController
+
   constructor(ctx: Context, public config: Config) {
     super(ctx, 'lfvs.bilibili.schedule')
+    this.abortController = new AbortController()
+    
+    // 监听插件卸载，立刻触发中断
+    ctx.effect(() => {
+      return () => {
+        this.abortController.abort()
+      }
+    })
     Promise.resolve().then(() => this.start())
   }
 
@@ -67,6 +77,26 @@ export class BilibiliScheduleService extends Service {
     if (this.ctx.get('lfvs.core').getAdapter(this.platform)) {
       this.startPolling()
     }
+  }
+
+  private sleep(ms: number) {
+    return new Promise<void>((resolve, reject) => {
+      if (this.abortController.signal.aborted) {
+        return reject(new Error('Context disposed'))
+      }
+
+      const timer = setTimeout(() => {
+        this.abortController.signal.removeEventListener('abort', abortHandler)
+        resolve()
+      }, ms)
+
+      const abortHandler = () => {
+        clearTimeout(timer)
+        reject(new Error('Context disposed'))
+      }
+
+      this.abortController.signal.addEventListener('abort', abortHandler)
+    })
   }
 
   private startPolling() {
@@ -144,17 +174,23 @@ export class BilibiliScheduleService extends Service {
       totalProcessed = videosToUpdate.length
 
       await Promise.all(videosToUpdate.map(async (video, index) => {
-        // 分摊延迟
-        await new Promise(resolve => setTimeout(resolve, index * intervalMs))
+        try {
+          // 分摊延迟
+          await this.sleep(index * intervalMs)
+          if (this.abortController.signal.aborted) return
 
-        const result = await this.processSingleVideo(video)
-        if (result) totalSuccess++
-        else totalFailure++
+          const result = await this.processSingleVideo(video)
+          if (result) totalSuccess++
+          else totalFailure++
+        } catch (error: any) {
+          if (error.message === 'Context disposed') return
+          throw error
+        }
       }))
 
     } finally {
       this.isUpdatingVideos = false
-      if (totalProcessed > 0) {
+      if (totalProcessed > 0 && !this.abortController.signal.aborted) {
         this.ctx.emit('lfvs/schedule-round-end', this.platform, 'video', totalProcessed, totalSuccess, totalFailure, Date.now() - roundStart)
       }
     }
@@ -346,6 +382,7 @@ export class BilibiliScheduleService extends Service {
       let totalFailure = 0
 
       for (const uploader of uploaders) {
+        if (this.abortController.signal.aborted) break
         const res = await adapter.getUploaderRecentVideos(uploader.uid)
         
         if (res.status === 'not_found') {
@@ -398,10 +435,15 @@ export class BilibiliScheduleService extends Service {
             existingVideoIds.add(vInfo.videoId) // 更新内存中的集合
           }
         }
-        await new Promise(resolve => setTimeout(resolve, 500))
+        try {
+          await this.sleep(500)
+        } catch (error: any) {
+          if (error.message === 'Context disposed') break
+          throw error
+        }
       }
 
-      if (uploaders.length > 0) {
+      if (uploaders.length > 0 && !this.abortController.signal.aborted) {
         this.ctx.emit('lfvs/schedule-round-end', this.platform, 'uploader', uploaders.length, totalSuccess, totalFailure, Date.now() - roundStart)
       }
     } finally {
